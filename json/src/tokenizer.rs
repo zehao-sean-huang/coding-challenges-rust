@@ -32,6 +32,9 @@ pub(crate) enum TokenizeError {
     UnterminatedString {
         position: usize,
     },
+    InvalidUnicodeEscape {
+        position: usize,
+    },
     InvalidNumber {
         position: usize,
     },
@@ -69,19 +72,37 @@ fn tokenize_string<'input>(
                 return Ok(Token::String(&content[start..end]));
             }
             b'\\' => {
-                return Err(TokenizeError::UnsupportedEscape {
-                    position: *position,
-                });
+                let escape_start = *position;
+                *position += 1;
+
+                match bytes.get(*position).copied() {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
+                        *position += 1;
+                    }
+                    Some(b'u') => {
+                        *position += 1;
+
+                        for _ in 0..4 {
+                            match bytes.get(*position).copied() {
+                                Some(byte) if byte.is_ascii_hexdigit() => *position += 1,
+                                _ => {
+                                    return Err(TokenizeError::InvalidUnicodeEscape {
+                                        position: *position,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(TokenizeError::UnsupportedEscape {
+                            position: escape_start,
+                        });
+                    }
+                }
             }
             0x00..=0x1f => {
                 return Err(TokenizeError::ControlCharacter {
                     position: *position,
-                });
-            }
-            0x80..=0xff => {
-                return Err(TokenizeError::UnexpectedCharacter {
-                    position: *position,
-                    byte,
                 });
             }
             _ => *position += 1,
@@ -274,8 +295,20 @@ mod tests {
     }
 
     #[test]
+    fn accepts_supported_escapes() {
+        let input =
+            r#"{"key":"quote: \" slash: \/ backslash: \\ controls: \b\f\n\r\t unicode: \uCAFE"}"#;
+
+        assert!(tokenize_json(input).is_ok());
+    }
+
+    #[test]
     fn rejects_unsupported_escapes() {
         let input = r#"{"key": "escaped\nvalue"}"#;
+
+        assert!(tokenize_json(input).is_ok());
+
+        let input = r#"{"key": "escaped\xvalue"}"#;
 
         assert_eq!(
             tokenize_json(input),
