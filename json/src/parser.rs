@@ -177,6 +177,21 @@ impl<'tokens, 'input> Parser<'tokens, 'input> {
         Ok(())
     }
 
+    fn exit_container(&mut self) {
+        debug_assert!(self.depth > 0);
+        self.depth -= 1;
+    }
+
+    fn within_container<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, ParseError<'input>>,
+    ) -> Result<T, ParseError<'input>> {
+        self.enter_container()?;
+        let result = parse(self);
+        self.exit_container();
+        result
+    }
+
     fn parse_pair(&mut self) -> Result<JsonPair<'input>, ParseError<'input>> {
         let key = self.expect_string()?;
         self.expect_token(Token::Colon, ExpectedToken::Colon)?;
@@ -186,7 +201,10 @@ impl<'tokens, 'input> Parser<'tokens, 'input> {
     }
 
     fn parse_object(&mut self) -> Result<JsonObject<'input>, ParseError<'input>> {
-        self.enter_container()?;
+        self.within_container(|parser| parser.parse_object_contents())
+    }
+
+    fn parse_object_contents(&mut self) -> Result<JsonObject<'input>, ParseError<'input>> {
         self.expect_token(Token::LeftBrace, ExpectedToken::LeftBrace)?;
         let mut pairs = Vec::new();
 
@@ -199,13 +217,15 @@ impl<'tokens, 'input> Parser<'tokens, 'input> {
         }
 
         self.expect_token(Token::RightBrace, ExpectedToken::RightBrace)?;
-        self.depth -= 1;
 
         Ok(JsonObject { pairs })
     }
 
     fn parse_array(&mut self) -> Result<Vec<JsonValue<'input>>, ParseError<'input>> {
-        self.enter_container()?;
+        self.within_container(|parser| parser.parse_array_contents())
+    }
+
+    fn parse_array_contents(&mut self) -> Result<Vec<JsonValue<'input>>, ParseError<'input>> {
         self.expect_token(Token::LeftBracket, ExpectedToken::LeftBracket)?;
         let mut values = Vec::new();
 
@@ -218,7 +238,6 @@ impl<'tokens, 'input> Parser<'tokens, 'input> {
         }
 
         self.expect_token(Token::RightBracket, ExpectedToken::RightBracket)?;
-        self.depth -= 1;
 
         Ok(values)
     }
@@ -469,5 +488,14 @@ mod tests {
                 found: Token::RightBracket,
             })
         );
+    }
+
+    #[test]
+    fn restores_depth_after_a_nested_parse_error() {
+        let tokens = tokenize_json(r#"{"nested":[true,]}"#).unwrap();
+        let mut parser = Parser::new(&tokens);
+
+        assert!(parser.parse_document().is_err());
+        assert_eq!(parser.depth, 0);
     }
 }
