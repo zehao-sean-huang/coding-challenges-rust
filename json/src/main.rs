@@ -1,6 +1,10 @@
 use std::env;
 use std::fs;
 
+mod tokenizer;
+
+use tokenizer::{tokenize_json, Token};
+
 #[derive(Debug)]
 enum Json {
     Obj,
@@ -11,30 +15,15 @@ fn get_content_from_file(file_path: &str) -> String {
     fs::read_to_string(file_path).expect(format!("the file {} cannot be read", file_path).as_str())
 }
 
-fn tokenize_json<'a>(content: &'a String) -> Vec<&'a str> {
-    let mut result = vec![];
+#[derive(Debug, PartialEq)]
+struct JsonObject<'input> {
+    key: &'input str,
+    value: &'input str,
+}
 
-    let mut start = -1;    
-    let mut in_whitespace = false;
-    let mut in_alphanumeric = false;
-
-    for (i, c) in content.chars().enumerate() {
-        match c {
-            '{' | '}' | '"' | ':' | '[' | ']' => {
-                result.push(&content[i..i + 1]);
-                in_whitespace = false;
-                in_alphanumeric = false;
-            },
-            ' ' | '\n' | '\r' | '\t' => {
-                
-            },
-            c if c.is_alphanumeric() {
-                todo!()
-            }
-        }
-    }
-
-    result
+struct Parser<'tokens, 'input> {
+    tokens: &'tokens [Token<'input>],
+    position: usize,
 }
 
 fn parse_json_obj<'a>(tokens: &'a Vec<&'a str>) -> Json {
@@ -58,8 +47,7 @@ fn main() {
         panic!("wrong number of arguments");
     }
     let content = get_content_from_file(&args[1]);
-    let tokenized = tokenize_json(&content);
-    let parsed = parse_json_obj(&tokenized);
+    let tokenized = tokenize_json(&content).expect("the JSON cannot be tokenized");
 
-    println!("{:?}", &parsed);
+    println!("{:?}", &tokenized);
 }
