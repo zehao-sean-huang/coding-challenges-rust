@@ -90,11 +90,22 @@ impl HuffmanNode {
             HuffmanNode::Intermediate { count, .. } => *count,
         }
     }
+
+    fn smallest_character(&self) -> char {
+        match self {
+            HuffmanNode::Leaf { c, .. } => *c,
+            HuffmanNode::Intermediate { left, right, .. } => {
+                left.smallest_character().min(right.smallest_character())
+            }
+        }
+    }
 }
 
 impl Ord for HuffmanNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.count().cmp(&other.count())
+        self.count()
+            .cmp(&other.count())
+            .then_with(|| self.smallest_character().cmp(&other.smallest_character()))
     }
 }
 
@@ -207,5 +218,16 @@ mod tests {
         for (less_frequent, more_frequent) in [('a', 'b'), ('b', 'c'), ('c', 'd'), ('d', 'e')] {
             assert!(table[&more_frequent].1 <= table[&less_frequent].1);
         }
+    }
+
+    #[test]
+    fn equal_frequencies_produce_codes_independent_of_insertion_order() {
+        let first = frequencies(&[('d', 1), ('b', 1), ('a', 1), ('c', 1)]);
+        let second = frequencies(&[('a', 1), ('c', 1), ('d', 1), ('b', 1)]);
+
+        assert_eq!(
+            HuffmanTree::new(&first).to_prefix_table(),
+            HuffmanTree::new(&second).to_prefix_table()
+        );
     }
 }
