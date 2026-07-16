@@ -1,4 +1,5 @@
 mod command;
+mod database;
 mod logging;
 mod server;
 

@@ -1,4 +1,5 @@
 use crate::command;
+use crate::database::Database;
 use crate::logging::{
     ClientIdentity, ConnectionStats, connected_line, disconnected_line, io_error_line,
     protocol_error_line, request_line, response_line,
@@ -6,6 +7,7 @@ use crate::logging::{
 use redis::resp::{DecodeErrorKind, Decoder, Encoder, RespValue};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
@@ -16,18 +18,24 @@ static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn run(address: &str) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
+    let database = Arc::new(Database::default());
     let bound_address = listener.local_addr()?;
     eprintln!("[redis] listening address={bound_address}");
     for stream in listener.incoming() {
         let stream = stream?;
+        let database = database.clone();
         drop(thread::spawn(move || {
-            let _ = handle_connection(stream, MAX_INCOMPLETE_BUFFER);
+            let _ = handle_connection(stream, MAX_INCOMPLETE_BUFFER, database);
         }));
     }
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, buffer_limit: usize) -> io::Result<()> {
+fn handle_connection(
+    mut stream: TcpStream,
+    buffer_limit: usize,
+    database: Arc<Database>,
+) -> io::Result<()> {
     let client = ClientIdentity {
         id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
         peer: socket_description(stream.peer_addr()),
@@ -38,7 +46,14 @@ fn handle_connection(mut stream: TcpStream, buffer_limit: usize) -> io::Result<(
     let mut log = io::stderr();
     log_line(&mut log, &connected_line(&client));
 
-    let result = handle_io_logged(&mut stream, buffer_limit, &client, &mut stats, &mut log);
+    let result = handle_io_logged(
+        &mut stream,
+        buffer_limit,
+        &database,
+        &client,
+        &mut stats,
+        &mut log,
+    );
     let duration = started.elapsed();
     match &result {
         Ok(()) => log_line(&mut log, &disconnected_line(&client, &stats, duration)),
@@ -58,9 +73,11 @@ fn handle_io<T: Read + Write>(mut stream: T, buffer_limit: usize) -> io::Result<
         local: "test-local".to_owned(),
     };
     let mut stats = ConnectionStats::default();
+    let database = Database::default();
     handle_io_logged(
         &mut stream,
         buffer_limit,
+        &database,
         &client,
         &mut stats,
         &mut io::sink(),
@@ -70,6 +87,7 @@ fn handle_io<T: Read + Write>(mut stream: T, buffer_limit: usize) -> io::Result<
 fn handle_io_logged<T: Read + Write, W: Write>(
     stream: &mut T,
     buffer_limit: usize,
+    database: &Database,
     client: &ClientIdentity,
     stats: &mut ConnectionStats,
     log: &mut W,
@@ -96,7 +114,7 @@ fn handle_io_logged<T: Read + Write, W: Write>(
                     };
                     log_line(log, &request_line(client, &parts));
                     stats.requests += 1;
-                    let response = command::dispatch(parts);
+                    let response = command::dispatch(parts, database);
                     let encoded = encoder
                         .to_bytes(&response)
                         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -189,9 +207,11 @@ fn command_parts(value: RespValue) -> Option<Vec<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::{handle_connection, handle_io, handle_io_logged};
+    use crate::database::Database;
     use crate::logging::{ClientIdentity, ConnectionStats};
     use std::io::{self, Cursor, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::Arc;
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
@@ -206,11 +226,18 @@ mod tests {
     }
 
     fn connection(limit: usize) -> (TcpStream, JoinHandle<io::Result<()>>) {
+        connection_with_database(limit, Arc::new(Database::default()))
+    }
+
+    fn connection_with_database(
+        limit: usize,
+        database: Arc<Database>,
+    ) -> (TcpStream, JoinHandle<io::Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let client = TcpStream::connect(address).unwrap();
         let (server, _) = listener.accept().unwrap();
-        let handle = thread::spawn(move || handle_connection(server, limit));
+        let handle = thread::spawn(move || handle_connection(server, limit, database));
         (client, handle)
     }
 
@@ -255,6 +282,55 @@ mod tests {
             .unwrap();
         read_exact(&mut client, b"+PONG\r\n$3\r\none\r\n");
         finish(client, handle);
+    }
+
+    #[test]
+    fn handles_pipelined_set_followed_by_get() {
+        let (mut client, handle) = connection(TEST_LIMIT);
+        client
+            .write_all(
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
+            )
+            .unwrap();
+        read_exact(&mut client, b"+OK\r\n$5\r\nvalue\r\n");
+        finish(client, handle);
+    }
+
+    #[test]
+    fn values_survive_the_connection_that_created_them() {
+        let database = Arc::new(Database::default());
+        let (mut writer, writer_handle) = connection_with_database(TEST_LIMIT, database.clone());
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n")
+            .unwrap();
+        read_exact(&mut writer, b"+OK\r\n");
+        finish(writer, writer_handle);
+
+        let (mut reader, reader_handle) = connection_with_database(TEST_LIMIT, database);
+        reader
+            .write_all(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n")
+            .unwrap();
+        read_exact(&mut reader, b"$5\r\nvalue\r\n");
+        finish(reader, reader_handle);
+    }
+
+    #[test]
+    fn concurrent_client_observes_value_written_by_another() {
+        let database = Arc::new(Database::default());
+        let (mut writer, writer_handle) = connection_with_database(TEST_LIMIT, database.clone());
+        let (mut reader, reader_handle) = connection_with_database(TEST_LIMIT, database);
+
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n")
+            .unwrap();
+        read_exact(&mut writer, b"+OK\r\n");
+        reader
+            .write_all(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n")
+            .unwrap();
+        read_exact(&mut reader, b"$5\r\nvalue\r\n");
+
+        finish(writer, writer_handle);
+        finish(reader, reader_handle);
     }
 
     #[test]
@@ -359,7 +435,15 @@ mod tests {
         let mut stats = ConnectionStats::default();
         let mut logs = Vec::new();
 
-        handle_io_logged(&mut io, TEST_LIMIT, &test_client(), &mut stats, &mut logs).unwrap();
+        handle_io_logged(
+            &mut io,
+            TEST_LIMIT,
+            &Database::default(),
+            &test_client(),
+            &mut stats,
+            &mut logs,
+        )
+        .unwrap();
 
         assert_eq!(io.written, b"+PONG\r\n");
         assert_eq!(
@@ -376,6 +460,31 @@ mod tests {
     }
 
     #[test]
+    fn logs_null_bulk_string_response_explicitly() {
+        let request = b"*2\r\n$3\r\nGET\r\n$7\r\nmissing\r\n";
+        let mut io = TestIo {
+            reader: Cursor::new(request.to_vec()),
+            written: Vec::new(),
+        };
+        let mut stats = ConnectionStats::default();
+        let mut logs = Vec::new();
+
+        handle_io_logged(
+            &mut io,
+            TEST_LIMIT,
+            &Database::default(),
+            &test_client(),
+            &mut stats,
+            &mut logs,
+        )
+        .unwrap();
+
+        assert_eq!(io.written, b"$-1\r\n");
+        let logs = String::from_utf8(logs).unwrap();
+        assert!(logs.contains("[redis] client-0007 response null bulk-string\n"));
+    }
+
+    #[test]
     fn logs_protocol_reason_and_counts_the_error_response() {
         let mut io = TestIo {
             reader: Cursor::new(b"?\r\n".to_vec()),
@@ -384,7 +493,15 @@ mod tests {
         let mut stats = ConnectionStats::default();
         let mut logs = Vec::new();
 
-        handle_io_logged(&mut io, TEST_LIMIT, &test_client(), &mut stats, &mut logs).unwrap();
+        handle_io_logged(
+            &mut io,
+            TEST_LIMIT,
+            &Database::default(),
+            &test_client(),
+            &mut stats,
+            &mut logs,
+        )
+        .unwrap();
 
         assert_eq!(io.written, b"-ERR Protocol error\r\n");
         assert_eq!(stats.requests, 0);

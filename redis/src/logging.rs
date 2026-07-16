@@ -75,6 +75,7 @@ pub(crate) fn response_line(client: &ClientIdentity, response: &RespValue) -> St
         RespValue::BulkString(value) => {
             format!("bulk-string {} bytes {}", value.len(), render_bytes(value))
         }
+        RespValue::NullBulkString => "null bulk-string".to_owned(),
         _ => "RESP value".to_owned(),
     };
     format!("[redis] {} response {summary}", client_label(client))
