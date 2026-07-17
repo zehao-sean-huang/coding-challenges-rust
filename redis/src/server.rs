@@ -1,10 +1,10 @@
 use crate::command;
 use crate::database::Database;
 use crate::logging::{
-    ClientIdentity, ConnectionStats, connected_line, disconnected_line, io_error_line,
+    ClientIdentity, ConnectionStats, LogMode, connected_line, disconnected_line, io_error_line,
     protocol_error_line, request_line, response_line,
 };
-use redis::resp::{DecodeErrorKind, Decoder, Encoder, RespValue};
+use redis::resp::{DecodeError, DecodeErrorKind, Decoder, Encoder, RespValue};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -16,16 +16,18 @@ const PROTOCOL_ERROR: &[u8] = b"-ERR Protocol error\r\n";
 const MAX_INCOMPLETE_BUFFER: usize = 536_870_912 + 64;
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) fn run(address: &str) -> io::Result<()> {
+pub(crate) fn run(address: &str, log_mode: LogMode) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
     let database = Arc::new(Database::default());
     let bound_address = listener.local_addr()?;
-    eprintln!("[redis] listening address={bound_address}");
+    if log_mode == LogMode::Enabled {
+        eprintln!("[redis] listening address={bound_address}");
+    }
     for stream in listener.incoming() {
         let stream = stream?;
         let database = database.clone();
         drop(thread::spawn(move || {
-            let _ = handle_connection(stream, MAX_INCOMPLETE_BUFFER, database);
+            let _ = handle_connection(stream, MAX_INCOMPLETE_BUFFER, database, log_mode);
         }));
     }
     Ok(())
@@ -35,62 +37,121 @@ fn handle_connection(
     mut stream: TcpStream,
     buffer_limit: usize,
     database: Arc<Database>,
+    log_mode: LogMode,
 ) -> io::Result<()> {
-    let client = ClientIdentity {
-        id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
-        peer: socket_description(stream.peer_addr()),
-        local: socket_description(stream.local_addr()),
-    };
-    let started = Instant::now();
-    let mut stats = ConnectionStats::default();
-    let mut log = io::stderr();
-    log_line(&mut log, &connected_line(&client));
-
-    let result = handle_io_logged(
-        &mut stream,
-        buffer_limit,
-        &database,
-        &client,
-        &mut stats,
-        &mut log,
-    );
-    let duration = started.elapsed();
-    match &result {
-        Ok(()) => log_line(&mut log, &disconnected_line(&client, &stats, duration)),
-        Err(error) => log_line(
-            &mut log,
-            &io_error_line(&client, &stats, duration, &error.to_string()),
-        ),
+    match log_mode {
+        LogMode::Enabled => {
+            let client = ClientIdentity {
+                id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
+                peer: socket_description(stream.peer_addr()),
+                local: socket_description(stream.local_addr()),
+            };
+            let mut logger = EnabledLogger::new(client, io::stderr());
+            logger.connected();
+            let result = handle_io(&mut stream, buffer_limit, &database, &mut logger);
+            logger.finished(&result);
+            result
+        }
+        LogMode::Disabled => handle_io(&mut stream, buffer_limit, &database, &mut DisabledLogger),
     }
-    result
 }
 
-#[cfg(test)]
-fn handle_io<T: Read + Write>(mut stream: T, buffer_limit: usize) -> io::Result<()> {
-    let client = ClientIdentity {
-        id: 0,
-        peer: "test-peer".to_owned(),
-        local: "test-local".to_owned(),
-    };
-    let mut stats = ConnectionStats::default();
-    let database = Database::default();
-    handle_io_logged(
-        &mut stream,
-        buffer_limit,
-        &database,
-        &client,
-        &mut stats,
-        &mut io::sink(),
-    )
+trait EventLogger {
+    #[inline(always)]
+    fn received(&mut self, _bytes: usize) {}
+
+    #[inline(always)]
+    fn sent(&mut self, _bytes: usize) {}
+
+    #[inline(always)]
+    fn request(&mut self, _parts: &[Vec<u8>]) {}
+
+    #[inline(always)]
+    fn response(&mut self, _response: &RespValue) {}
+
+    #[inline(always)]
+    fn protocol_error(&mut self, _reason: &str) {}
+
+    #[inline(always)]
+    fn incomplete_buffer(&mut self, _buffer_limit: usize) {}
+
+    #[inline(always)]
+    fn decode_error(&mut self, _error: &DecodeError) {}
 }
 
-fn handle_io_logged<T: Read + Write, W: Write>(
+struct DisabledLogger;
+
+struct EnabledLogger<W> {
+    client: ClientIdentity,
+    stats: ConnectionStats,
+    started: Instant,
+    writer: W,
+}
+
+impl<W: Write> EnabledLogger<W> {
+    fn new(client: ClientIdentity, writer: W) -> Self {
+        Self {
+            client,
+            stats: ConnectionStats::default(),
+            started: Instant::now(),
+            writer,
+        }
+    }
+
+    fn connected(&mut self) {
+        log_line(&mut self.writer, &connected_line(&self.client));
+    }
+
+    fn finished(&mut self, result: &io::Result<()>) {
+        let duration = self.started.elapsed();
+        let line = match result {
+            Ok(()) => disconnected_line(&self.client, &self.stats, duration),
+            Err(error) => io_error_line(&self.client, &self.stats, duration, &error.to_string()),
+        };
+        log_line(&mut self.writer, &line);
+    }
+}
+
+impl EventLogger for DisabledLogger {}
+
+impl<W: Write> EventLogger for EnabledLogger<W> {
+    fn received(&mut self, bytes: usize) {
+        self.stats.received += bytes as u64;
+    }
+
+    fn sent(&mut self, bytes: usize) {
+        self.stats.sent += bytes as u64;
+    }
+
+    fn request(&mut self, parts: &[Vec<u8>]) {
+        self.stats.requests += 1;
+        log_line(&mut self.writer, &request_line(&self.client, parts));
+    }
+
+    fn response(&mut self, response: &RespValue) {
+        log_line(&mut self.writer, &response_line(&self.client, response));
+    }
+
+    fn protocol_error(&mut self, reason: &str) {
+        log_line(&mut self.writer, &protocol_error_line(&self.client, reason));
+    }
+
+    fn incomplete_buffer(&mut self, buffer_limit: usize) {
+        self.protocol_error(&format!(
+            "incomplete request exceeds {buffer_limit}-byte buffer limit"
+        ));
+    }
+
+    fn decode_error(&mut self, error: &DecodeError) {
+        self.protocol_error(&error.to_string());
+    }
+}
+
+fn handle_io<T: Read + Write, L: EventLogger>(
     stream: &mut T,
     buffer_limit: usize,
     database: &Database,
-    client: &ClientIdentity,
-    stats: &mut ConnectionStats,
-    log: &mut W,
+    logger: &mut L,
 ) -> io::Result<()> {
     let decoder = Decoder::default();
     let encoder = Encoder::default();
@@ -102,24 +163,24 @@ fn handle_io_logged<T: Read + Write, W: Write>(
         if bytes_read == 0 {
             return Ok(());
         }
-        stats.received += bytes_read as u64;
+        logger.received(bytes_read);
         buffer.extend_from_slice(&chunk[..bytes_read]);
 
         loop {
             match decoder.decode(&buffer) {
                 Ok(decoded) => {
                     let Some(parts) = command_parts(decoded.value) else {
-                        reject_protocol(stream, stats, log, client, "invalid command framing")?;
+                        logger.protocol_error("invalid command framing");
+                        reject_protocol(stream, logger)?;
                         return Ok(());
                     };
-                    log_line(log, &request_line(client, &parts));
-                    stats.requests += 1;
+                    logger.request(&parts);
                     let response = command::dispatch(parts, database);
                     let encoded = encoder
                         .to_bytes(&response)
                         .map_err(|error| io::Error::other(error.to_string()))?;
-                    write_all_counted(stream, &encoded, stats)?;
-                    log_line(log, &response_line(client, &response));
+                    write_all_counted(stream, &encoded, logger)?;
+                    logger.response(&response);
                     buffer.drain(..decoded.consumed);
                     if buffer.is_empty() {
                         break;
@@ -127,19 +188,15 @@ fn handle_io_logged<T: Read + Write, W: Write>(
                 }
                 Err(error) if error.kind == DecodeErrorKind::IncompleteInput => {
                     if buffer.len() > buffer_limit {
-                        reject_protocol(
-                            stream,
-                            stats,
-                            log,
-                            client,
-                            &format!("incomplete request exceeds {buffer_limit}-byte buffer limit"),
-                        )?;
+                        logger.incomplete_buffer(buffer_limit);
+                        reject_protocol(stream, logger)?;
                         return Ok(());
                     }
                     break;
                 }
                 Err(error) => {
-                    reject_protocol(stream, stats, log, client, &error.to_string())?;
+                    logger.decode_error(&error);
+                    reject_protocol(stream, logger)?;
                     return Ok(());
                 }
             }
@@ -147,27 +204,20 @@ fn handle_io_logged<T: Read + Write, W: Write>(
     }
 }
 
-fn reject_protocol<T: Write, W: Write>(
-    stream: &mut T,
-    stats: &mut ConnectionStats,
-    log: &mut W,
-    client: &ClientIdentity,
-    reason: &str,
-) -> io::Result<()> {
-    log_line(log, &protocol_error_line(client, reason));
-    write_all_counted(stream, PROTOCOL_ERROR, stats)
+fn reject_protocol<T: Write, L: EventLogger>(stream: &mut T, logger: &mut L) -> io::Result<()> {
+    write_all_counted(stream, PROTOCOL_ERROR, logger)
 }
 
-fn write_all_counted<T: Write>(
+fn write_all_counted<T: Write, L: EventLogger>(
     writer: &mut T,
     mut bytes: &[u8],
-    stats: &mut ConnectionStats,
+    logger: &mut L,
 ) -> io::Result<()> {
     while !bytes.is_empty() {
         match writer.write(bytes) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(written) => {
-                stats.sent += written as u64;
+                logger.sent(written);
                 bytes = &bytes[written..];
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -206,9 +256,9 @@ fn command_parts(value: RespValue) -> Option<Vec<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_connection, handle_io, handle_io_logged};
+    use super::{DisabledLogger, EnabledLogger, handle_connection, handle_io};
     use crate::database::Database;
-    use crate::logging::{ClientIdentity, ConnectionStats};
+    use crate::logging::{ClientIdentity, ConnectionStats, LogMode};
     use std::io::{self, Cursor, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::sync::Arc;
@@ -237,7 +287,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = TcpStream::connect(address).unwrap();
         let (server, _) = listener.accept().unwrap();
-        let handle = thread::spawn(move || handle_connection(server, limit, database));
+        let handle =
+            thread::spawn(move || handle_connection(server, limit, database, LogMode::Enabled));
         (client, handle)
     }
 
@@ -432,31 +483,41 @@ mod tests {
             reader: Cursor::new(request.to_vec()),
             written: Vec::new(),
         };
-        let mut stats = ConnectionStats::default();
-        let mut logs = Vec::new();
+        let mut logger = EnabledLogger::new(test_client(), Vec::new());
 
-        handle_io_logged(
-            &mut io,
-            TEST_LIMIT,
-            &Database::default(),
-            &test_client(),
-            &mut stats,
-            &mut logs,
-        )
-        .unwrap();
+        handle_io(&mut io, TEST_LIMIT, &Database::default(), &mut logger).unwrap();
 
         assert_eq!(io.written, b"+PONG\r\n");
         assert_eq!(
-            stats,
+            logger.stats,
             ConnectionStats {
                 requests: 1,
                 received: request.len() as u64,
                 sent: 7,
             }
         );
-        let logs = String::from_utf8(logs).unwrap();
+        let logs = String::from_utf8(logger.writer).unwrap();
         assert!(logs.contains("[redis] client-0007 request PING\n"));
         assert!(logs.contains("[redis] client-0007 response PONG\n"));
+    }
+
+    #[test]
+    fn disabled_logger_is_zero_sized_and_preserves_responses() {
+        assert_eq!(std::mem::size_of::<DisabledLogger>(), 0);
+        let mut io = TestIo {
+            reader: Cursor::new(b"*1\r\n$4\r\nPING\r\n".to_vec()),
+            written: Vec::new(),
+        };
+
+        handle_io(
+            &mut io,
+            TEST_LIMIT,
+            &Database::default(),
+            &mut DisabledLogger,
+        )
+        .unwrap();
+
+        assert_eq!(io.written, b"+PONG\r\n");
     }
 
     #[test]
@@ -466,21 +527,12 @@ mod tests {
             reader: Cursor::new(request.to_vec()),
             written: Vec::new(),
         };
-        let mut stats = ConnectionStats::default();
-        let mut logs = Vec::new();
+        let mut logger = EnabledLogger::new(test_client(), Vec::new());
 
-        handle_io_logged(
-            &mut io,
-            TEST_LIMIT,
-            &Database::default(),
-            &test_client(),
-            &mut stats,
-            &mut logs,
-        )
-        .unwrap();
+        handle_io(&mut io, TEST_LIMIT, &Database::default(), &mut logger).unwrap();
 
         assert_eq!(io.written, b"$-1\r\n");
-        let logs = String::from_utf8(logs).unwrap();
+        let logs = String::from_utf8(logger.writer).unwrap();
         assert!(logs.contains("[redis] client-0007 response null bulk-string\n"));
     }
 
@@ -490,24 +542,15 @@ mod tests {
             reader: Cursor::new(b"?\r\n".to_vec()),
             written: Vec::new(),
         };
-        let mut stats = ConnectionStats::default();
-        let mut logs = Vec::new();
+        let mut logger = EnabledLogger::new(test_client(), Vec::new());
 
-        handle_io_logged(
-            &mut io,
-            TEST_LIMIT,
-            &Database::default(),
-            &test_client(),
-            &mut stats,
-            &mut logs,
-        )
-        .unwrap();
+        handle_io(&mut io, TEST_LIMIT, &Database::default(), &mut logger).unwrap();
 
         assert_eq!(io.written, b"-ERR Protocol error\r\n");
-        assert_eq!(stats.requests, 0);
-        assert_eq!(stats.received, 3);
-        assert_eq!(stats.sent, io.written.len() as u64);
-        let logs = String::from_utf8(logs).unwrap();
+        assert_eq!(logger.stats.requests, 0);
+        assert_eq!(logger.stats.received, 3);
+        assert_eq!(logger.stats.sent, io.written.len() as u64);
+        let logs = String::from_utf8(logger.writer).unwrap();
         assert!(logs.contains("[redis] client-0007 protocol-error"));
         assert!(logs.contains("unknown prefix 0x3f"));
     }
@@ -530,10 +573,16 @@ mod tests {
 
     #[test]
     fn response_write_failure_terminates_the_affected_connection() {
-        let io = WriteFailure {
+        let mut io = WriteFailure {
             reader: Cursor::new(b"*1\r\n$4\r\nPING\r\n".to_vec()),
         };
-        let error = handle_io(io, TEST_LIMIT).unwrap_err();
+        let error = handle_io(
+            &mut io,
+            TEST_LIMIT,
+            &Database::default(),
+            &mut DisabledLogger,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
 
         let (mut client, handle) = connection(TEST_LIMIT);

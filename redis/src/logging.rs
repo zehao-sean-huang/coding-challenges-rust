@@ -3,6 +3,12 @@ use std::time::Duration;
 
 const MAX_RENDERED_CONTENT: usize = 120;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogMode {
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClientIdentity {
     pub(crate) id: u64,
