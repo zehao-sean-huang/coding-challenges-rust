@@ -147,6 +147,53 @@ impl<W: Write> EventLogger for EnabledLogger<W> {
     }
 }
 
+#[inline]
+fn advance_cursor(cursor: usize, decoded: usize, buffer_len: usize) -> io::Result<usize> {
+    let remaining = buffer_len.checked_sub(cursor).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request buffer cursor exceeds buffer length",
+        )
+    })?;
+    if decoded == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RESP decoder made no progress",
+        ));
+    }
+    if decoded > remaining {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RESP decoder consumed beyond its input",
+        ));
+    }
+    cursor.checked_add(decoded).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request buffer cursor overflowed",
+        )
+    })
+}
+
+fn compact_buffer(buffer: &mut Vec<u8>, consumed: usize) -> io::Result<()> {
+    let remaining = buffer.len().checked_sub(consumed).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request buffer cursor exceeds buffer length",
+        )
+    })?;
+    if consumed == 0 {
+        return Ok(());
+    }
+    if remaining == 0 {
+        buffer.clear();
+        return Ok(());
+    }
+    buffer.copy_within(consumed.., 0);
+    buffer.truncate(remaining);
+    Ok(())
+}
+
 fn handle_io<T: Read + Write, L: EventLogger>(
     stream: &mut T,
     buffer_limit: usize,
@@ -166,9 +213,17 @@ fn handle_io<T: Read + Write, L: EventLogger>(
         logger.received(bytes_read);
         buffer.extend_from_slice(&chunk[..bytes_read]);
 
+        let mut consumed = 0;
         loop {
-            match decoder.decode(&buffer) {
+            let remaining = buffer.get(consumed..).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "request buffer cursor exceeds buffer length",
+                )
+            })?;
+            match decoder.decode(remaining) {
                 Ok(decoded) => {
+                    consumed = advance_cursor(consumed, decoded.consumed, buffer.len())?;
                     let Some(parts) = command_parts(decoded.value) else {
                         logger.protocol_error("invalid command framing");
                         reject_protocol(stream, logger)?;
@@ -181,13 +236,12 @@ fn handle_io<T: Read + Write, L: EventLogger>(
                         .map_err(|error| io::Error::other(error.to_string()))?;
                     write_all_counted(stream, &encoded, logger)?;
                     logger.response(&response);
-                    buffer.drain(..decoded.consumed);
-                    if buffer.is_empty() {
+                    if consumed == buffer.len() {
                         break;
                     }
                 }
                 Err(error) if error.kind == DecodeErrorKind::IncompleteInput => {
-                    if buffer.len() > buffer_limit {
+                    if remaining.len() > buffer_limit {
                         logger.incomplete_buffer(buffer_limit);
                         reject_protocol(stream, logger)?;
                         return Ok(());
@@ -201,6 +255,7 @@ fn handle_io<T: Read + Write, L: EventLogger>(
                 }
             }
         }
+        compact_buffer(&mut buffer, consumed)?;
     }
 }
 
@@ -256,7 +311,9 @@ fn command_parts(value: RespValue) -> Option<Vec<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DisabledLogger, EnabledLogger, handle_connection, handle_io};
+    use super::{
+        DisabledLogger, EnabledLogger, advance_cursor, compact_buffer, handle_connection, handle_io,
+    };
     use crate::database::Database;
     use crate::logging::{ClientIdentity, ConnectionStats, LogMode};
     use std::io::{self, Cursor, Read, Write};
@@ -332,6 +389,30 @@ mod tests {
             .write_all(b"*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nECHO\r\n$3\r\none\r\n")
             .unwrap();
         read_exact(&mut client, b"+PONG\r\n$3\r\none\r\n");
+        finish(client, handle);
+    }
+
+    #[test]
+    fn pipelined_requests_before_a_fragmented_request_remain_ordered() {
+        let (mut client, handle) = connection(TEST_LIMIT);
+        client
+            .write_all(b"*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nECHO\r\n$3\r\none\r\n*1\r\n$4\r\nPI")
+            .unwrap();
+        read_exact(&mut client, b"+PONG\r\n$3\r\none\r\n");
+
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut byte = [0];
+        let error = client.read(&mut byte).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+
+        client.set_read_timeout(None).unwrap();
+        client.write_all(b"NG\r\n").unwrap();
+        read_exact(&mut client, b"+PONG\r\n");
         finish(client, handle);
     }
 
@@ -518,6 +599,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(io.written, b"+PONG\r\n");
+    }
+
+    #[test]
+    fn cursor_progress_is_checked() {
+        assert_eq!(advance_cursor(4, 3, 10).unwrap(), 7);
+        assert_eq!(
+            advance_cursor(4, 0, 10).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            advance_cursor(4, 7, 10).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn compaction_preserves_only_the_live_suffix() {
+        let mut partial = b"PINGpartial".to_vec();
+        compact_buffer(&mut partial, 4).unwrap();
+        assert_eq!(partial, b"partial");
+
+        let mut complete = b"PING".to_vec();
+        compact_buffer(&mut complete, 4).unwrap();
+        assert!(complete.is_empty());
+
+        let mut untouched = b"partial".to_vec();
+        compact_buffer(&mut untouched, 0).unwrap();
+        assert_eq!(untouched, b"partial");
+    }
+
+    #[test]
+    fn invalid_compaction_is_connection_local_error() {
+        let mut buffer = b"PING".to_vec();
+        assert_eq!(
+            compact_buffer(&mut buffer, 5).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(buffer, b"PING");
     }
 
     #[test]
