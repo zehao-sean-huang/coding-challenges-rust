@@ -28,6 +28,30 @@ pub(super) fn run(address: &str, log_mode: LogMode) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(super) fn run_test_listener(
+    listener: TcpListener,
+    log_mode: LogMode,
+    expected_connections: usize,
+    buffer_limit: usize,
+) -> io::Result<()> {
+    let database = Arc::new(Database::default());
+    let mut handlers = Vec::with_capacity(expected_connections);
+    for _ in 0..expected_connections {
+        let (stream, _) = listener.accept()?;
+        let database = database.clone();
+        handlers.push(thread::spawn(move || {
+            handle_connection(stream, buffer_limit, database, log_mode)
+        }));
+    }
+    for handler in handlers {
+        handler
+            .join()
+            .map_err(|_| io::Error::other("connection handler panicked"))??;
+    }
+    Ok(())
+}
+
 fn handle_connection(
     stream: TcpStream,
     buffer_limit: usize,

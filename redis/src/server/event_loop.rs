@@ -11,8 +11,10 @@ use mio::{Events, Interest, Poll, Token};
 use redis::resp::{Encoder, RequestDecoder};
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 pub(super) const ACCEPT_BUDGET: usize = 64;
 const LISTENER: Token = Token(0);
@@ -43,6 +45,78 @@ where
     event_loop.run()
 }
 
+#[cfg(test)]
+pub(super) fn run_test_listener(
+    listener: TcpListener,
+    log_mode: LogMode,
+    expected_connections: usize,
+    buffer_limit: usize,
+    deadline: Instant,
+) -> io::Result<()> {
+    match log_mode {
+        LogMode::Enabled => run_test_with_logger(
+            listener,
+            expected_connections,
+            buffer_limit,
+            deadline,
+            |stream| {
+                EnabledLogger::new(
+                    client_identity(stream.peer_addr(), stream.local_addr()),
+                    io::stderr(),
+                )
+            },
+        ),
+        LogMode::Disabled => run_test_with_logger(
+            listener,
+            expected_connections,
+            buffer_limit,
+            deadline,
+            |_stream| DisabledLogger,
+        ),
+    }
+}
+
+#[cfg(test)]
+fn run_test_with_logger<L, F>(
+    listener: TcpListener,
+    expected_connections: usize,
+    buffer_limit: usize,
+    deadline: Instant,
+    logger_factory: F,
+) -> io::Result<()>
+where
+    L: EventLogger,
+    F: FnMut(&mio::net::TcpStream) -> L,
+{
+    let mut event_loop = EventLoop::from_listener(listener, logger_factory, buffer_limit)?;
+    loop {
+        if event_loop.accepted_connections > expected_connections {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "test server accepted more connections than declared",
+            ));
+        }
+        if event_loop.accepted_connections == expected_connections
+            && event_loop.connections.is_empty()
+        {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "test event loop deadline elapsed",
+            ));
+        }
+        event_loop.drive_once(Some(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(50)),
+        ))?;
+    }
+}
+
 enum WorkItem {
     Listener,
     Connection(Token),
@@ -69,6 +143,8 @@ struct EventLoop<L, F> {
     encoder: Encoder,
     buffer_limit: usize,
     logger_factory: F,
+    #[cfg(test)]
+    accepted_connections: usize,
 }
 
 impl<L, F> EventLoop<L, F>
@@ -77,8 +153,16 @@ where
     F: FnMut(&mio::net::TcpStream) -> L,
 {
     fn bind(address: &str, logger_factory: F, buffer_limit: usize) -> io::Result<Self> {
-        let poll = Poll::new()?;
         let standard_listener = std::net::TcpListener::bind(address)?;
+        Self::from_listener(standard_listener, logger_factory, buffer_limit)
+    }
+
+    fn from_listener(
+        standard_listener: TcpListener,
+        logger_factory: F,
+        buffer_limit: usize,
+    ) -> io::Result<Self> {
+        let poll = Poll::new()?;
         standard_listener.set_nonblocking(true)?;
         let mut listener = mio::net::TcpListener::from_std(standard_listener);
         poll.registry()
@@ -98,6 +182,8 @@ where
             encoder: Encoder::default(),
             buffer_limit,
             logger_factory,
+            #[cfg(test)]
+            accepted_connections: 0,
         })
     }
 
@@ -188,6 +274,13 @@ where
                 Err(error) => return Err(error),
             };
             accepted += 1;
+            #[cfg(test)]
+            {
+                self.accepted_connections = self
+                    .accepted_connections
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("accepted connection count overflowed"))?;
+            }
 
             let token = self.allocate_token()?;
             let logger = (self.logger_factory)(&socket);
