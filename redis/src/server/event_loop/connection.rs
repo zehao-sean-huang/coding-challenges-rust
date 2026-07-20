@@ -64,6 +64,23 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
         }
     }
 
+    pub(super) fn desired_interest(&self) -> Option<DesiredInterest> {
+        self.desired_interest
+    }
+
+    pub(super) fn mark_queued(&mut self) -> bool {
+        if self.queued {
+            false
+        } else {
+            self.queued = true;
+            true
+        }
+    }
+
+    pub(super) fn clear_queued(&mut self) {
+        self.queued = false;
+    }
+
     pub(super) fn service(
         &mut self,
         readiness: Readiness,
@@ -72,11 +89,24 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
         encoder: &Encoder,
     ) -> io::Result<ServiceResult> {
         let output_pending_before = self.output_pending()?;
-        let requeue = self.read_available(readiness.readable)?;
-        self.dispatch_available(database, decoder, encoder)?;
-        let output_pending_after_dispatch = self.output_pending()?;
-        if readiness.writable || (!output_pending_before && output_pending_after_dispatch) {
-            self.write_available()?;
+        let mut requeue = false;
+
+        if output_pending_before {
+            if readiness.writable {
+                requeue |= self.write_available()?;
+                if !self.output_pending()? && !self.close_after_flush {
+                    requeue |= self.has_user_space_work(decoder)?;
+                }
+            }
+        } else {
+            requeue |= self.read_available(readiness.readable)?;
+            requeue |= self.dispatch_available(database, decoder, encoder)?;
+            if self.output_pending()? {
+                requeue |= self.write_available()?;
+                if !self.output_pending()? && !self.close_after_flush {
+                    requeue |= self.has_user_space_work(decoder)?;
+                }
+            }
         }
 
         let output_pending = self.output_pending()?;
@@ -142,9 +172,9 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
         database: &Database,
         decoder: &RequestDecoder,
         encoder: &Encoder,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if self.close_after_flush {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut commands = 0;
@@ -203,10 +233,10 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
                 self.input.clear();
             }
         }
-        Ok(())
+        Ok(commands == COMMAND_BUDGET && self.has_user_space_work(decoder)?)
     }
 
-    fn write_available(&mut self) -> io::Result<()> {
+    fn write_available(&mut self) -> io::Result<bool> {
         let mut work = 0;
         while self.output_pending()? && work < WRITE_BUDGET {
             let remaining_budget = WRITE_BUDGET.checked_sub(work).ok_or_else(|| {
@@ -252,7 +282,21 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
                 self.output = Vec::with_capacity(NORMAL_OUTPUT_CAPACITY);
             }
         }
-        Ok(())
+        Ok(work == WRITE_BUDGET && self.output_pending()?)
+    }
+
+    fn has_user_space_work(&self, decoder: &RequestDecoder) -> io::Result<bool> {
+        let remaining = self.input.get(self.consumed..).ok_or_else(cursor_error)?;
+        if remaining.is_empty() {
+            return Ok(false);
+        }
+
+        match decoder.decode(remaining) {
+            Err(error) if error.kind == DecodeErrorKind::IncompleteInput => {
+                Ok(self.peer_closed || remaining.len() > self.buffer_limit)
+            }
+            _ => Ok(true),
+        }
     }
 
     fn compact_input(&mut self) -> io::Result<()> {
@@ -324,7 +368,10 @@ fn cursor_error() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{Connection, DesiredInterest, Readiness};
+    use super::{
+        Connection, DesiredInterest, MAX_RETAINED_OUTPUT, NORMAL_OUTPUT_CAPACITY,
+        OUTPUT_BATCH_TARGET, READ_BUDGET, Readiness, WRITE_BUDGET,
+    };
     use crate::database::Database;
     use crate::server::connection_logging::DisabledLogger;
     use redis::resp::{Encoder, RequestDecoder};
@@ -339,11 +386,18 @@ mod tests {
         Eof,
     }
 
+    enum WriteAction {
+        Accept(usize),
+        WouldBlock,
+    }
+
     struct ScriptedIo {
         reads: VecDeque<ReadAction>,
         written: Vec<u8>,
         max_write: usize,
         block_writes: bool,
+        writes: VecDeque<WriteAction>,
+        read_calls: usize,
     }
 
     impl ScriptedIo {
@@ -353,6 +407,8 @@ mod tests {
                 written: Vec::new(),
                 max_write: usize::MAX,
                 block_writes: false,
+                writes: VecDeque::new(),
+                read_calls: 0,
             }
         }
     }
@@ -374,6 +430,7 @@ mod tests {
 
     impl Read for ScriptedIo {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.read_calls += 1;
             match self.reads.pop_front().unwrap_or(ReadAction::WouldBlock) {
                 ReadAction::Bytes(bytes) => {
                     let copied = bytes.len().min(buffer.len());
@@ -392,6 +449,16 @@ mod tests {
 
     impl Write for ScriptedIo {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if let Some(action) = self.writes.pop_front() {
+                return match action {
+                    WriteAction::Accept(limit) => {
+                        let written = buffer.len().min(limit);
+                        self.written.extend_from_slice(&buffer[..written]);
+                        Ok(written)
+                    }
+                    WriteAction::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
+                };
+            }
             if self.block_writes {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
@@ -403,6 +470,257 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn partial_write_preserves_remaining_output_and_interest() {
+        let mut socket = ScriptedIo::new([
+            ReadAction::Bytes(b"*1\r\n$4\r\nPING\r\n".to_vec()),
+            ReadAction::WouldBlock,
+        ]);
+        socket.writes = [WriteAction::Accept(3), WriteAction::WouldBlock]
+            .into_iter()
+            .collect();
+        let mut connection = Connection::new(socket, DisabledLogger, TEST_LIMIT);
+        let database = Database::default();
+        let decoder = RequestDecoder::default();
+        let encoder = Encoder::default();
+
+        let first = connection
+            .service(
+                Readiness {
+                    readable: true,
+                    writable: false,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+
+        assert_eq!(first.interest, Some(DesiredInterest::Writable));
+        assert_eq!(connection.desired_interest(), first.interest);
+        assert_eq!(&connection.output[connection.written..], b"NG\r\n");
+        assert!(!first.close);
+
+        let second = connection
+            .service(
+                Readiness {
+                    readable: false,
+                    writable: true,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+
+        assert_eq!(connection.socket.written, b"+PONG\r\n");
+        assert_eq!(second.interest, Some(DesiredInterest::Readable));
+        assert_eq!(connection.desired_interest(), second.interest);
+    }
+
+    #[test]
+    fn continuation_enqueue_is_deduplicated_until_cleared() {
+        let mut connection = Connection::new(ScriptedIo::new([]), DisabledLogger, TEST_LIMIT);
+
+        assert!(connection.mark_queued());
+        assert!(!connection.mark_queued());
+        connection.clear_queued();
+        assert!(connection.mark_queued());
+    }
+
+    #[test]
+    fn command_budget_preserves_blocked_pipeline_for_later_continuation() {
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+        let pipeline = ping.repeat(65);
+        let mut socket = ScriptedIo::new([
+            ReadAction::Bytes(pipeline),
+            ReadAction::WouldBlock,
+            ReadAction::Bytes(ping.to_vec()),
+        ]);
+        socket.block_writes = true;
+        let mut connection = Connection::new(socket, DisabledLogger, TEST_LIMIT * 2);
+        let database = Database::default();
+        let decoder = RequestDecoder::default();
+        let encoder = Encoder::default();
+
+        let first = connection
+            .service(
+                Readiness {
+                    readable: true,
+                    writable: false,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+        let reads_after_first = connection.socket.read_calls;
+
+        assert!(first.requeue);
+        assert_eq!(first.interest, Some(DesiredInterest::Writable));
+        assert_eq!(connection.output.len(), 64 * b"+PONG\r\n".len());
+        assert!(connection.socket.written.is_empty());
+
+        let blocked_continuation = connection
+            .service(
+                Readiness {
+                    readable: true,
+                    writable: false,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+        assert!(!blocked_continuation.requeue);
+        assert_eq!(connection.socket.read_calls, reads_after_first);
+        assert_eq!(connection.output.len(), 64 * b"+PONG\r\n".len());
+
+        connection.socket.block_writes = false;
+        let drained = connection
+            .service(
+                Readiness {
+                    readable: false,
+                    writable: true,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+        assert!(drained.requeue);
+        assert_eq!(drained.interest, Some(DesiredInterest::Readable));
+        assert_eq!(connection.socket.written, b"+PONG\r\n".repeat(64));
+
+        let resumed = connection
+            .service(
+                Readiness {
+                    readable: false,
+                    writable: false,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+        assert!(!resumed.close);
+        assert_eq!(resumed.interest, Some(DesiredInterest::Readable));
+        assert_eq!(connection.socket.written, b"+PONG\r\n".repeat(65));
+    }
+
+    #[test]
+    fn exact_read_budget_requeues_before_would_block() {
+        let prefix = b"*2\r\n$4\r\nECHO\r\n$262144\r\n";
+        let mut incomplete = Vec::with_capacity(READ_BUDGET);
+        incomplete.extend_from_slice(prefix);
+        incomplete.resize(READ_BUDGET, b'x');
+        let socket = ScriptedIo::new([ReadAction::Bytes(incomplete), ReadAction::WouldBlock]);
+        let mut connection = Connection::new(socket, DisabledLogger, READ_BUDGET * 2);
+
+        let result = service_readable(&mut connection, &Database::default()).unwrap();
+
+        assert!(result.requeue);
+        assert_eq!(
+            connection.socket.read_calls,
+            READ_BUDGET / super::READ_CHUNK
+        );
+        assert!(connection.socket.written.is_empty());
+        assert_eq!(result.interest, Some(DesiredInterest::Readable));
+    }
+
+    #[test]
+    fn exact_write_budget_requeues_before_would_block() {
+        let socket = ScriptedIo::new([]);
+        let mut connection = Connection::new(socket, DisabledLogger, TEST_LIMIT);
+        connection.output = vec![b'x'; WRITE_BUDGET + 1];
+
+        let result = connection
+            .service(
+                Readiness {
+                    readable: false,
+                    writable: true,
+                },
+                &Database::default(),
+                &RequestDecoder::default(),
+                &Encoder::default(),
+            )
+            .unwrap();
+
+        assert!(result.requeue);
+        assert_eq!(connection.socket.written.len(), WRITE_BUDGET);
+        assert_eq!(&connection.output[connection.written..], b"x");
+        assert_eq!(result.interest, Some(DesiredInterest::Writable));
+    }
+
+    #[test]
+    fn incomplete_input_after_would_block_does_not_requeue() {
+        let socket = ScriptedIo::new([
+            ReadAction::Bytes(b"*1\r\n$4\r\nPI".to_vec()),
+            ReadAction::WouldBlock,
+        ]);
+        let mut connection = Connection::new(socket, DisabledLogger, TEST_LIMIT);
+
+        let result = service_readable(&mut connection, &Database::default()).unwrap();
+
+        assert!(!result.requeue);
+        assert_eq!(result.interest, Some(DesiredInterest::Readable));
+    }
+
+    #[test]
+    fn oversized_output_releases_excess_capacity_after_drain() {
+        let socket = ScriptedIo::new([]);
+        let mut connection = Connection::new(socket, DisabledLogger, TEST_LIMIT);
+        connection.output = vec![b'x'; MAX_RETAINED_OUTPUT + 1];
+
+        let first = connection
+            .service(
+                Readiness {
+                    readable: false,
+                    writable: true,
+                },
+                &Database::default(),
+                &RequestDecoder::default(),
+                &Encoder::default(),
+            )
+            .unwrap();
+        assert!(first.requeue);
+
+        let drained = connection
+            .service(
+                Readiness {
+                    readable: false,
+                    writable: true,
+                },
+                &Database::default(),
+                &RequestDecoder::default(),
+                &Encoder::default(),
+            )
+            .unwrap();
+
+        assert_eq!(connection.output.len(), 0);
+        assert!(connection.output.capacity() >= NORMAL_OUTPUT_CAPACITY);
+        assert!(connection.output.capacity() <= MAX_RETAINED_OUTPUT);
+        assert_eq!(drained.interest, Some(DesiredInterest::Readable));
+    }
+
+    #[test]
+    fn response_larger_than_batch_target_is_written() {
+        let payload = vec![b'x'; OUTPUT_BATCH_TARGET + 1];
+        let mut request = format!("*2\r\n$4\r\nECHO\r\n${}\r\n", payload.len()).into_bytes();
+        request.extend_from_slice(&payload);
+        request.extend_from_slice(b"\r\n");
+        let socket = ScriptedIo::new([ReadAction::Bytes(request), ReadAction::WouldBlock]);
+        let mut connection = Connection::new(socket, DisabledLogger, READ_BUDGET);
+
+        let result = service_readable(&mut connection, &Database::default()).unwrap();
+
+        let mut expected = format!("${}\r\n", payload.len()).into_bytes();
+        expected.extend_from_slice(&payload);
+        expected.extend_from_slice(b"\r\n");
+        assert_eq!(connection.socket.written, expected);
+        assert_eq!(result.interest, Some(DesiredInterest::Readable));
     }
 
     #[test]
