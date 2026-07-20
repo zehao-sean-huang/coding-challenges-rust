@@ -4,7 +4,7 @@ use crate::logging::{
     ClientIdentity, ConnectionStats, LogMode, connected_line, disconnected_line, io_error_line,
     protocol_error_line, request_line, response_line,
 };
-use redis::resp::{DecodeError, DecodeErrorKind, Decoder, Encoder, RespValue};
+use redis::resp::{DecodeError, DecodeErrorKind, Encoder, RequestDecoder, RespValue};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -64,7 +64,7 @@ trait EventLogger {
     fn sent(&mut self, _bytes: usize) {}
 
     #[inline(always)]
-    fn request(&mut self, _parts: &[Vec<u8>]) {}
+    fn request(&mut self, _parts: &[&[u8]]) {}
 
     #[inline(always)]
     fn response(&mut self, _response: &RespValue) {}
@@ -123,7 +123,7 @@ impl<W: Write> EventLogger for EnabledLogger<W> {
         self.stats.sent += bytes as u64;
     }
 
-    fn request(&mut self, parts: &[Vec<u8>]) {
+    fn request(&mut self, parts: &[&[u8]]) {
         self.stats.requests += 1;
         log_line(&mut self.writer, &request_line(&self.client, parts));
     }
@@ -200,7 +200,7 @@ fn handle_io<T: Read + Write, L: EventLogger>(
     database: &Database,
     logger: &mut L,
 ) -> io::Result<()> {
-    let decoder = Decoder::default();
+    let decoder = RequestDecoder::default();
     let encoder = Encoder::default();
     let mut buffer = Vec::new();
     let mut chunk = [0; 8192];
@@ -224,13 +224,13 @@ fn handle_io<T: Read + Write, L: EventLogger>(
             match decoder.decode(remaining) {
                 Ok(decoded) => {
                     consumed = advance_cursor(consumed, decoded.consumed, buffer.len())?;
-                    let Some(parts) = command_parts(decoded.value) else {
+                    if decoded.parts.is_empty() {
                         logger.protocol_error("invalid command framing");
                         reject_protocol(stream, logger)?;
                         return Ok(());
-                    };
-                    logger.request(&parts);
-                    let response = command::dispatch(parts, database);
+                    }
+                    logger.request(&decoded.parts);
+                    let response = command::dispatch(&decoded.parts, database);
                     let encoded = encoder
                         .to_bytes(&response)
                         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -247,6 +247,11 @@ fn handle_io<T: Read + Write, L: EventLogger>(
                         return Ok(());
                     }
                     break;
+                }
+                Err(error) if error.kind == DecodeErrorKind::InvalidCommandFraming => {
+                    logger.protocol_error("invalid command framing");
+                    reject_protocol(stream, logger)?;
+                    return Ok(());
                 }
                 Err(error) => {
                     logger.decode_error(&error);
@@ -291,22 +296,6 @@ fn socket_description(address: io::Result<std::net::SocketAddr>) -> String {
         |error| format!("unavailable ({error})"),
         |address| address.to_string(),
     )
-}
-
-fn command_parts(value: RespValue) -> Option<Vec<Vec<u8>>> {
-    let RespValue::Array(values) = value else {
-        return None;
-    };
-    if values.is_empty() {
-        return None;
-    }
-    values
-        .into_iter()
-        .map(|value| match value {
-            RespValue::BulkString(data) => Some(data),
-            _ => None,
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -580,6 +569,23 @@ mod tests {
         let logs = String::from_utf8(logger.writer).unwrap();
         assert!(logs.contains("[redis] client-0007 request PING\n"));
         assert!(logs.contains("[redis] client-0007 response PONG\n"));
+    }
+
+    #[test]
+    fn logs_pipelined_binary_set_and_get_from_one_input_buffer() {
+        let request = b"*3\r\n$3\r\nSET\r\n$2\r\n\0\xff\r\n$2\r\n\xff\0\r\n*2\r\n$3\r\nGET\r\n$2\r\n\0\xff\r\n";
+        let mut io = TestIo {
+            reader: Cursor::new(request.to_vec()),
+            written: Vec::new(),
+        };
+        let mut logger = EnabledLogger::new(test_client(), Vec::new());
+
+        handle_io(&mut io, TEST_LIMIT, &Database::default(), &mut logger).unwrap();
+
+        assert_eq!(io.written, b"+OK\r\n$2\r\n\xff\0\r\n");
+        let logs = String::from_utf8(logger.writer).unwrap();
+        assert!(logs.contains(r#"[redis] client-0007 request SET "\x00\xff" "\xff\x00""#));
+        assert!(logs.contains(r#"[redis] client-0007 request GET "\x00\xff""#));
     }
 
     #[test]

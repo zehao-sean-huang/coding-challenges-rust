@@ -20,6 +20,7 @@ pub enum DecodeErrorKind {
     InvalidBoolean,
     InvalidNull,
     InvalidVerbatim,
+    InvalidCommandFraming,
     BulkLimitExceeded { len: usize, max: usize },
     AggregateLimitExceeded { len: usize, max: usize },
     DepthLimitExceeded { depth: usize, max: usize },
@@ -48,6 +49,7 @@ impl fmt::Display for DecodeError {
             DecodeErrorKind::InvalidBoolean => f.write_str("invalid boolean"),
             DecodeErrorKind::InvalidNull => f.write_str("invalid null"),
             DecodeErrorKind::InvalidVerbatim => f.write_str("invalid verbatim string"),
+            DecodeErrorKind::InvalidCommandFraming => f.write_str("invalid command framing"),
             DecodeErrorKind::BulkLimitExceeded { len, max } => {
                 write!(f, "bulk length {len} exceeds limit {max}")
             }
