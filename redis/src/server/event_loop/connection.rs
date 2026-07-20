@@ -41,6 +41,7 @@ pub(super) struct Connection<S, L> {
     written: usize,
     peer_closed: bool,
     close_after_flush: bool,
+    read_continuation_pending: bool,
     queued: bool,
     desired_interest: Option<DesiredInterest>,
     buffer_limit: usize,
@@ -57,6 +58,7 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
             written: 0,
             peer_closed: false,
             close_after_flush: false,
+            read_continuation_pending: false,
             queued: false,
             desired_interest: Some(DesiredInterest::Readable),
             buffer_limit,
@@ -95,6 +97,7 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
             if readiness.writable {
                 requeue |= self.write_available()?;
                 if !self.output_pending()? && !self.close_after_flush {
+                    requeue |= self.read_continuation_pending;
                     requeue |= self.has_user_space_work(decoder)?;
                 }
             }
@@ -128,7 +131,11 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
     }
 
     fn read_available(&mut self, readable: bool) -> io::Result<bool> {
-        if !readable || self.peer_closed || self.close_after_flush || self.output_pending()? {
+        if (!readable && !self.read_continuation_pending)
+            || self.peer_closed
+            || self.close_after_flush
+            || self.output_pending()?
+        {
             return Ok(false);
         }
 
@@ -136,6 +143,7 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
         let mut chunk = [0; READ_CHUNK];
         loop {
             if work == READ_BUDGET {
+                self.read_continuation_pending = true;
                 return Ok(true);
             }
             let available = READ_BUDGET.checked_sub(work).ok_or_else(|| {
@@ -144,11 +152,13 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
             let chunk_len = available.min(chunk.len());
             match self.socket.read(&mut chunk[..chunk_len]) {
                 Ok(0) => {
+                    self.read_continuation_pending = false;
                     self.peer_closed = true;
                     return Ok(false);
                 }
                 Ok(read) => {
                     if read > chunk_len {
+                        self.read_continuation_pending = false;
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "reader returned more bytes than requested",
@@ -161,8 +171,14 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
                     })?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
-                Err(error) => return Err(error),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.read_continuation_pending = false;
+                    return Ok(false);
+                }
+                Err(error) => {
+                    self.read_continuation_pending = false;
+                    return Err(error);
+                }
             }
         }
     }
@@ -628,6 +644,74 @@ mod tests {
         );
         assert!(connection.socket.written.is_empty());
         assert_eq!(result.interest, Some(DesiredInterest::Readable));
+    }
+
+    #[test]
+    fn blocked_output_preserves_exact_read_budget_continuation() {
+        let value_len = READ_BUDGET - 31;
+        let mut exact_request =
+            format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${value_len}\r\n").into_bytes();
+        exact_request.resize(exact_request.len() + value_len, b'x');
+        exact_request.extend_from_slice(b"\r\n");
+        assert_eq!(exact_request.len(), READ_BUDGET);
+
+        let ping = b"*1\r\n$4\r\nPING\r\n";
+        let mut socket = ScriptedIo::new([
+            ReadAction::Bytes(exact_request),
+            ReadAction::Bytes(ping.to_vec()),
+            ReadAction::WouldBlock,
+        ]);
+        socket.block_writes = true;
+        let mut connection = Connection::new(socket, DisabledLogger, READ_BUDGET * 2);
+        let database = Database::default();
+        let decoder = RequestDecoder::default();
+        let encoder = Encoder::default();
+
+        let first = connection
+            .service(
+                Readiness {
+                    readable: true,
+                    writable: false,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+        assert!(first.requeue);
+        assert_eq!(first.interest, Some(DesiredInterest::Writable));
+        assert!(connection.socket.written.is_empty());
+
+        connection.socket.block_writes = false;
+        let drained = connection
+            .service(
+                Readiness {
+                    readable: false,
+                    writable: true,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+        assert!(drained.requeue);
+        assert_eq!(drained.interest, Some(DesiredInterest::Readable));
+        assert_eq!(connection.socket.written, b"+OK\r\n");
+
+        let resumed = connection
+            .service(
+                Readiness {
+                    readable: false,
+                    writable: false,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+        assert!(!resumed.requeue);
+        assert_eq!(resumed.interest, Some(DesiredInterest::Readable));
+        assert_eq!(connection.socket.written, b"+OK\r\n+PONG\r\n");
     }
 
     #[test]
