@@ -1,3 +1,4 @@
+mod connection_logging;
 mod threaded;
 
 use crate::logging::LogMode;

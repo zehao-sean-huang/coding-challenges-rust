@@ -1,20 +1,15 @@
+use super::connection_logging::{DisabledLogger, EnabledLogger, EventLogger, client_identity};
 use crate::command;
 use crate::database::Database;
-use crate::logging::{
-    ClientIdentity, ConnectionStats, LogMode, connected_line, disconnected_line, io_error_line,
-    protocol_error_line, request_line, response_line,
-};
-use redis::resp::{DecodeError, DecodeErrorKind, Encoder, RequestDecoder, RespValue};
+use crate::logging::LogMode;
+use redis::resp::{DecodeErrorKind, Encoder, RequestDecoder};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Instant;
 
 const PROTOCOL_ERROR: &[u8] = b"-ERR Protocol error\r\n";
 const MAX_INCOMPLETE_BUFFER: usize = 536_870_912 + 64;
-static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn run(address: &str, log_mode: LogMode) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
@@ -34,117 +29,35 @@ pub(super) fn run(address: &str, log_mode: LogMode) -> io::Result<()> {
 }
 
 fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     buffer_limit: usize,
     database: Arc<Database>,
     log_mode: LogMode,
 ) -> io::Result<()> {
     match log_mode {
         LogMode::Enabled => {
-            let client = ClientIdentity {
-                id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
-                peer: socket_description(stream.peer_addr()),
-                local: socket_description(stream.local_addr()),
-            };
-            let mut logger = EnabledLogger::new(client, io::stderr());
-            logger.connected();
-            let result = handle_io(&mut stream, buffer_limit, &database, &mut logger);
-            logger.finished(&result);
-            result
+            let logger = EnabledLogger::new(
+                client_identity(stream.peer_addr(), stream.local_addr()),
+                io::stderr(),
+            );
+            handle_connection_with_logger(stream, buffer_limit, database, logger)
         }
-        LogMode::Disabled => handle_io(&mut stream, buffer_limit, &database, &mut DisabledLogger),
-    }
-}
-
-trait EventLogger {
-    #[inline(always)]
-    fn received(&mut self, _bytes: usize) {}
-
-    #[inline(always)]
-    fn sent(&mut self, _bytes: usize) {}
-
-    #[inline(always)]
-    fn request(&mut self, _parts: &[&[u8]]) {}
-
-    #[inline(always)]
-    fn response(&mut self, _response: &RespValue) {}
-
-    #[inline(always)]
-    fn protocol_error(&mut self, _reason: &str) {}
-
-    #[inline(always)]
-    fn incomplete_buffer(&mut self, _buffer_limit: usize) {}
-
-    #[inline(always)]
-    fn decode_error(&mut self, _error: &DecodeError) {}
-}
-
-struct DisabledLogger;
-
-struct EnabledLogger<W> {
-    client: ClientIdentity,
-    stats: ConnectionStats,
-    started: Instant,
-    writer: W,
-}
-
-impl<W: Write> EnabledLogger<W> {
-    fn new(client: ClientIdentity, writer: W) -> Self {
-        Self {
-            client,
-            stats: ConnectionStats::default(),
-            started: Instant::now(),
-            writer,
+        LogMode::Disabled => {
+            handle_connection_with_logger(stream, buffer_limit, database, DisabledLogger)
         }
     }
-
-    fn connected(&mut self) {
-        log_line(&mut self.writer, &connected_line(&self.client));
-    }
-
-    fn finished(&mut self, result: &io::Result<()>) {
-        let duration = self.started.elapsed();
-        let line = match result {
-            Ok(()) => disconnected_line(&self.client, &self.stats, duration),
-            Err(error) => io_error_line(&self.client, &self.stats, duration, &error.to_string()),
-        };
-        log_line(&mut self.writer, &line);
-    }
 }
 
-impl EventLogger for DisabledLogger {}
-
-impl<W: Write> EventLogger for EnabledLogger<W> {
-    fn received(&mut self, bytes: usize) {
-        self.stats.received += bytes as u64;
-    }
-
-    fn sent(&mut self, bytes: usize) {
-        self.stats.sent += bytes as u64;
-    }
-
-    fn request(&mut self, parts: &[&[u8]]) {
-        self.stats.requests += 1;
-        log_line(&mut self.writer, &request_line(&self.client, parts));
-    }
-
-    fn response(&mut self, response: &RespValue) {
-        log_line(&mut self.writer, &response_line(&self.client, response));
-    }
-
-    fn protocol_error(&mut self, reason: &str) {
-        log_line(&mut self.writer, &protocol_error_line(&self.client, reason));
-    }
-
-    fn incomplete_buffer(&mut self, buffer_limit: usize) {
-        self.protocol_error(&format!(
-            "incomplete request exceeds {buffer_limit}-byte buffer limit"
-        ));
-    }
-
-    fn decode_error(&mut self, error: &DecodeError) {
-        self.protocol_error(&error.to_string());
-    }
+fn handle_connection_with_logger<L: EventLogger>(
+    mut stream: TcpStream,
+    buffer_limit: usize,
+    database: Arc<Database>,
+    mut logger: L,
+) -> io::Result<()> {
+    logger.connected();
+    let result = handle_io(&mut stream, buffer_limit, &database, &mut logger);
+    logger.finished(&result);
+    result
 }
 
 #[inline]
@@ -287,22 +200,10 @@ fn write_all_counted<T: Write, L: EventLogger>(
     Ok(())
 }
 
-fn log_line<W: Write>(writer: &mut W, line: &str) {
-    let _ = writeln!(writer, "{line}");
-}
-
-fn socket_description(address: io::Result<std::net::SocketAddr>) -> String {
-    address.map_or_else(
-        |error| format!("unavailable ({error})"),
-        |address| address.to_string(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        DisabledLogger, EnabledLogger, advance_cursor, compact_buffer, handle_connection, handle_io,
-    };
+    use super::super::connection_logging::{DisabledLogger, EnabledLogger};
+    use super::{advance_cursor, compact_buffer, handle_connection, handle_io};
     use crate::database::Database;
     use crate::logging::{ClientIdentity, ConnectionStats, LogMode};
     use std::io::{self, Cursor, Read, Write};
@@ -589,8 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_logger_is_zero_sized_and_preserves_responses() {
-        assert_eq!(std::mem::size_of::<DisabledLogger>(), 0);
+    fn disabled_logger_preserves_responses() {
         let mut io = TestIo {
             reader: Cursor::new(b"*1\r\n$4\r\nPING\r\n".to_vec()),
             written: Vec::new(),
