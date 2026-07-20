@@ -1,7 +1,7 @@
 use crate::database::Database;
 use redis::resp::RespValue;
 
-pub(crate) fn dispatch(parts: Vec<Vec<u8>>, database: &Database) -> RespValue {
+pub(crate) fn dispatch(parts: &[&[u8]], database: &Database) -> RespValue {
     let Some(name) = parts.first() else {
         return RespValue::SimpleError(b"ERR unknown command".to_vec());
     };
@@ -9,14 +9,14 @@ pub(crate) fn dispatch(parts: Vec<Vec<u8>>, database: &Database) -> RespValue {
     if name.eq_ignore_ascii_case(b"PING") {
         return match parts.len() {
             1 => RespValue::SimpleString(b"PONG".to_vec()),
-            2 => RespValue::BulkString(parts.into_iter().nth(1).expect("checked command arity")),
+            2 => RespValue::BulkString(parts[1].to_vec()),
             _ => wrong_arity("ping"),
         };
     }
 
     if name.eq_ignore_ascii_case(b"ECHO") {
         return match parts.len() {
-            2 => RespValue::BulkString(parts.into_iter().nth(1).expect("checked command arity")),
+            2 => RespValue::BulkString(parts[1].to_vec()),
             _ => wrong_arity("echo"),
         };
     }
@@ -25,17 +25,14 @@ pub(crate) fn dispatch(parts: Vec<Vec<u8>>, database: &Database) -> RespValue {
         if parts.len() != 3 {
             return wrong_arity("set");
         }
-        let mut arguments = parts.into_iter().skip(1);
-        let key = arguments.next().expect("checked command arity");
-        let value = arguments.next().expect("checked command arity");
-        database.set(key, value);
+        database.set(parts[1].to_vec(), parts[2].to_vec());
         return RespValue::SimpleString(b"OK".to_vec());
     }
 
     if name.eq_ignore_ascii_case(b"GET") {
         return match parts.len() {
             2 => database
-                .get(&parts[1])
+                .get(parts[1])
                 .map_or(RespValue::NullBulkString, RespValue::BulkString),
             _ => wrong_arity("get"),
         };
@@ -56,12 +53,12 @@ mod tests {
     use crate::database::Database;
     use redis::resp::RespValue;
 
-    fn command(parts: &[&[u8]]) -> Vec<Vec<u8>> {
-        parts.iter().map(|part| part.to_vec()).collect()
+    fn command<'a>(parts: &[&'a [u8]]) -> Vec<&'a [u8]> {
+        parts.to_vec()
     }
 
-    fn dispatch_once(parts: Vec<Vec<u8>>) -> RespValue {
-        dispatch(parts, &Database::default())
+    fn dispatch_once(parts: Vec<&[u8]>) -> RespValue {
+        dispatch(&parts, &Database::default())
     }
 
     #[test]
@@ -132,20 +129,20 @@ mod tests {
         let database = Database::default();
 
         assert_eq!(
-            dispatch(command(&[b"SET", b"key", b"first"]), &database),
+            dispatch(&command(&[b"SET", b"key", b"first"]), &database),
             RespValue::SimpleString(b"OK".to_vec())
         );
         assert_eq!(
-            dispatch(command(&[b"GET", b"key"]), &database),
+            dispatch(&command(&[b"GET", b"key"]), &database),
             RespValue::BulkString(b"first".to_vec())
         );
 
         assert_eq!(
-            dispatch(command(&[b"SET", b"key", b"second"]), &database),
+            dispatch(&command(&[b"SET", b"key", b"second"]), &database),
             RespValue::SimpleString(b"OK".to_vec())
         );
         assert_eq!(
-            dispatch(command(&[b"GET", b"key"]), &database),
+            dispatch(&command(&[b"GET", b"key"]), &database),
             RespValue::BulkString(b"second".to_vec())
         );
     }
@@ -163,19 +160,19 @@ mod tests {
         let database = Database::default();
 
         assert_eq!(
-            dispatch(command(&[b"sEt", b"\0\xff", b"\xff\0\r\n"]), &database),
+            dispatch(&command(&[b"sEt", b"\0\xff", b"\xff\0\r\n"]), &database),
             RespValue::SimpleString(b"OK".to_vec())
         );
         assert_eq!(
-            dispatch(command(&[b"GeT", b"\0\xff"]), &database),
+            dispatch(&command(&[b"GeT", b"\0\xff"]), &database),
             RespValue::BulkString(b"\xff\0\r\n".to_vec())
         );
         assert_eq!(
-            dispatch(command(&[b"SET", b"", b""]), &database),
+            dispatch(&command(&[b"SET", b"", b""]), &database),
             RespValue::SimpleString(b"OK".to_vec())
         );
         assert_eq!(
-            dispatch(command(&[b"GET", b""]), &database),
+            dispatch(&command(&[b"GET", b""]), &database),
             RespValue::BulkString(Vec::new())
         );
     }
@@ -205,5 +202,26 @@ mod tests {
                 RespValue::SimpleError(expected.to_vec())
             );
         }
+    }
+
+    #[test]
+    fn set_copies_only_at_database_boundary() {
+        let database = Database::default();
+        let mut request_storage = b"keyvalue".to_vec();
+        let parts = [
+            b"SET".as_slice(),
+            &request_storage[..3],
+            &request_storage[3..],
+        ];
+
+        assert_eq!(
+            dispatch(&parts, &database),
+            RespValue::SimpleString(b"OK".to_vec())
+        );
+        request_storage.fill(b'x');
+        assert_eq!(
+            dispatch(&[b"GET".as_slice(), b"key"], &database),
+            RespValue::BulkString(b"value".to_vec())
+        );
     }
 }

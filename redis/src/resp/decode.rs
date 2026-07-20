@@ -313,7 +313,10 @@ fn parse_i64(bytes: &[u8]) -> Result<i64, DecodeErrorKind> {
         .map_err(|_| DecodeErrorKind::NumericOverflow)
 }
 
-fn parse_length(bytes: &[u8], forbid_null: bool) -> Result<Option<usize>, DecodeErrorKind> {
+pub(super) fn parse_length(
+    bytes: &[u8],
+    forbid_null: bool,
+) -> Result<Option<usize>, DecodeErrorKind> {
     if bytes == b"-1" {
         return if forbid_null {
             Err(DecodeErrorKind::InvalidLength)

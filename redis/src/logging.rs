@@ -54,7 +54,7 @@ pub(crate) fn connected_line(client: &ClientIdentity) -> String {
     )
 }
 
-pub(crate) fn request_line(client: &ClientIdentity, parts: &[Vec<u8>]) -> String {
+pub(crate) fn request_line(client: &ClientIdentity, parts: &[&[u8]]) -> String {
     let command = parts
         .first()
         .map_or_else(|| "<empty>".to_owned(), |name| render_command(name));
@@ -176,11 +176,11 @@ mod tests {
     fn formats_requests_and_responses_for_people() {
         let client = client();
         assert_eq!(
-            request_line(&client, &[b"PING".to_vec()]),
+            request_line(&client, &[b"PING".as_slice()]),
             "[redis] client-0001 request PING"
         );
         assert_eq!(
-            request_line(&client, &[b"ECHO".to_vec(), b"hello\nworld".to_vec()]),
+            request_line(&client, &[b"ECHO".as_slice(), b"hello\nworld"]),
             r#"[redis] client-0001 request ECHO "hello\nworld""#
         );
         assert_eq!(
