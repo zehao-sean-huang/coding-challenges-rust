@@ -42,6 +42,7 @@ pub(super) struct Connection<S, L> {
     peer_closed: bool,
     close_after_flush: bool,
     read_continuation_pending: bool,
+    write_continuation_pending: bool,
     queued: bool,
     desired_interest: Option<DesiredInterest>,
     buffer_limit: usize,
@@ -59,6 +60,7 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
             peer_closed: false,
             close_after_flush: false,
             read_continuation_pending: false,
+            write_continuation_pending: false,
             queued: false,
             desired_interest: Some(DesiredInterest::Readable),
             buffer_limit,
@@ -94,7 +96,7 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
         let mut requeue = false;
 
         if output_pending_before {
-            if readiness.writable {
+            if readiness.writable || self.write_continuation_pending {
                 requeue |= self.write_available()?;
                 if !self.output_pending()? && !self.close_after_flush {
                     requeue |= self.read_continuation_pending;
@@ -253,6 +255,19 @@ impl<S: Read + Write, L: EventLogger> Connection<S, L> {
     }
 
     fn write_available(&mut self) -> io::Result<bool> {
+        match self.write_available_inner() {
+            Ok(requeue) => {
+                self.write_continuation_pending = requeue;
+                Ok(requeue)
+            }
+            Err(error) => {
+                self.write_continuation_pending = false;
+                Err(error)
+            }
+        }
+    }
+
+    fn write_available_inner(&mut self) -> io::Result<bool> {
         let mut work = 0;
         while self.output_pending()? && work < WRITE_BUDGET {
             let remaining_budget = WRITE_BUDGET.checked_sub(work).ok_or_else(|| {
@@ -739,6 +754,49 @@ mod tests {
     }
 
     #[test]
+    fn write_budget_continuation_resumes_without_writable_readiness() {
+        let socket = ScriptedIo::new([]);
+        let mut connection = Connection::new(socket, DisabledLogger, TEST_LIMIT);
+        connection.output = vec![b'x'; WRITE_BUDGET + 1];
+        connection.close_after_flush = true;
+        let database = Database::default();
+        let decoder = RequestDecoder::default();
+        let encoder = Encoder::default();
+
+        let first = connection
+            .service(
+                Readiness {
+                    readable: false,
+                    writable: true,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+        assert!(first.requeue);
+        assert!(!first.close);
+        assert_eq!(first.interest, Some(DesiredInterest::Writable));
+        assert_eq!(connection.socket.written.len(), WRITE_BUDGET);
+
+        let resumed = connection
+            .service(
+                Readiness {
+                    readable: false,
+                    writable: false,
+                },
+                &database,
+                &decoder,
+                &encoder,
+            )
+            .unwrap();
+        assert_eq!(connection.socket.written.len(), WRITE_BUDGET + 1);
+        assert!(!resumed.requeue);
+        assert!(resumed.close);
+        assert_eq!(resumed.interest, None);
+    }
+
+    #[test]
     fn incomplete_input_after_would_block_does_not_requeue() {
         let socket = ScriptedIo::new([
             ReadAction::Bytes(b"*1\r\n$4\r\nPI".to_vec()),
@@ -945,6 +1003,7 @@ mod tests {
 
         let readable_only = service_readable(&mut connection, &database).unwrap();
         assert!(connection.socket.written.is_empty());
+        assert!(!readable_only.requeue);
         assert_eq!(readable_only.interest, Some(DesiredInterest::Writable));
 
         let writable = connection
