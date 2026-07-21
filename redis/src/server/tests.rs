@@ -96,6 +96,25 @@ fn disabled_logging_preserves_ping_bytes() {
 }
 
 #[test]
+fn complete_request_before_write_shutdown_flushes_response_before_close() {
+    for_each_server_mode(|mode| {
+        let server = start_server(
+            mode,
+            LogMode::Disabled,
+            1,
+            event_loop::MAX_INCOMPLETE_BUFFER,
+        );
+        let mut client = connect(server.address);
+        client.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
+
+        let response = read_to_end_after_eof(client);
+
+        assert_eq!(response, b"+PONG\r\n", "mode: {mode:?}");
+        server.handle.join().unwrap().unwrap();
+    });
+}
+
+#[test]
 fn fragmented_ping_has_no_early_response_and_returns_exact_pong() {
     for_each_server_mode(|mode| {
         let server = start_server(
@@ -159,6 +178,44 @@ fn pipelined_binary_set_then_get_returns_exact_bytes() {
             )
             .unwrap();
         read_exact_response(&mut client, b"+OK\r\n$4\r\n\xff\0\r\n\r\n");
+        finish(vec![client], server);
+    });
+}
+
+#[test]
+fn get_missing_key_returns_exact_null_bulk_string() {
+    for_each_server_mode(|mode| {
+        let server = start_server(
+            mode,
+            LogMode::Disabled,
+            1,
+            event_loop::MAX_INCOMPLETE_BUFFER,
+        );
+        let mut client = connect(server.address);
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$7\r\nmissing\r\n")
+            .unwrap();
+        read_exact_response(&mut client, b"$-1\r\n");
+        finish(vec![client], server);
+    });
+}
+
+#[test]
+fn set_overwrite_then_get_returns_exact_final_value() {
+    for_each_server_mode(|mode| {
+        let server = start_server(
+            mode,
+            LogMode::Disabled,
+            1,
+            event_loop::MAX_INCOMPLETE_BUFFER,
+        );
+        let mut client = connect(server.address);
+        client
+            .write_all(
+                b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nfirst\r\n*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$6\r\nsecond\r\n*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
+            )
+            .unwrap();
+        read_exact_response(&mut client, b"+OK\r\n+OK\r\n$6\r\nsecond\r\n");
         finish(vec![client], server);
     });
 }

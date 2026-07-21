@@ -104,6 +104,8 @@ Readiness is a hint rather than a unit of work. A ready client may have an arbit
 
 A connection is queued for continuation when it exhausts a work budget while it can still make immediate progress. A per-connection flag prevents duplicate queue entries. The server drains a bounded number of continuations between poll calls and uses a zero poll timeout while runnable continuations remain; it blocks in `Poll::poll` only when the continuation queue is empty.
 
+Removing a connection synchronously removes its at-most-one queued continuation before finalizing the connection. Because connection tokens are never reused and only registered connections can be queued, teardown cannot leave stale work that keeps polling at a zero timeout or consumes another connection's continuation budget.
+
 Initial compile-time budgets are:
 
 ```text
@@ -193,7 +195,7 @@ The event-loop implementation is successful as an experimental mode when it has 
 
 ## Failure behavior and operability
 
-A listener bind, poller, registry, or token-allocation failure terminates the selected server and follows the existing top-level quiet-mode error policy. Accept errors that indicate a listener-level failure terminate the server; per-connection read, write, decode, or registration failures close only that connection after any explicitly queued protocol response.
+A listener bind, poller, registry, or token-allocation failure terminates the selected server and follows the existing top-level quiet-mode error policy. Before returning a fatal driver error, the event loop removes every active connection and calls its logger's `finished` method exactly once with that failure; connection deregistration failures do not replace the original fatal error returned by the server. Accept errors that indicate a listener-level failure terminate the server; per-connection read, write, decode, or registration failures close only that connection after any explicitly queued protocol response. The test runner counts a connection only after successful poller registration, so a connection-local registration failure cannot satisfy its expected-connection termination condition.
 
 The event loop must not panic on stale readiness, missing connection tokens, checked-arithmetic failure, malformed input, cursor inconsistency, or partial I/O. Unexpected readiness for a missing token is ignored and may be logged only when logging is enabled.
 

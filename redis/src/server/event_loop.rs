@@ -198,6 +198,13 @@ where
     }
 
     fn drive_once(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self.try_drive_once(timeout) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.finish_after_fatal_error(error)),
+        }
+    }
+
+    fn try_drive_once(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         let timeout = if self.continuations.is_empty() {
             timeout
         } else {
@@ -210,6 +217,15 @@ where
         self.service_continuations()?;
 
         Ok(())
+    }
+
+    fn finish_after_fatal_error(&mut self, error: io::Error) -> io::Error {
+        let kind = error.kind();
+        let message = error.to_string();
+        while let Some(token) = self.connections.keys().next().copied() {
+            self.remove_connection(token, Err(io::Error::new(kind, message.clone())));
+        }
+        error
     }
 
     fn service_ready_events(&mut self) -> io::Result<()> {
@@ -274,34 +290,41 @@ where
                 Err(error) => return Err(error),
             };
             accepted += 1;
-            #[cfg(test)]
-            {
-                self.accepted_connections = self
-                    .accepted_connections
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("accepted connection count overflowed"))?;
-            }
-
-            let token = self.allocate_token()?;
-            let logger = (self.logger_factory)(&socket);
-            let mut connection = Connection::new(socket, logger, self.buffer_limit);
-            let registration =
-                self.poll
-                    .registry()
-                    .register(&mut connection.socket, token, Interest::READABLE);
-            match registration {
-                Ok(()) => {
-                    connection.logger.connected();
-                    self.connections.insert(token, connection);
-                }
-                Err(error) => {
-                    let result = Err(error);
-                    connection.logger.finished(&result);
-                }
-            }
+            self.register_connection(socket)?;
         }
 
         self.enqueue_listener();
+        Ok(())
+    }
+
+    fn register_connection(&mut self, socket: mio::net::TcpStream) -> io::Result<()> {
+        let token = self.allocate_token()?;
+        let logger = (self.logger_factory)(&socket);
+        let mut connection = Connection::new(socket, logger, self.buffer_limit);
+        #[cfg(test)]
+        let accepted_connections = self
+            .accepted_connections
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("accepted connection count overflowed"))?;
+
+        match self
+            .poll
+            .registry()
+            .register(&mut connection.socket, token, Interest::READABLE)
+        {
+            Ok(()) => {
+                connection.logger.connected();
+                self.connections.insert(token, connection);
+                #[cfg(test)]
+                {
+                    self.accepted_connections = accepted_connections;
+                }
+            }
+            Err(error) => {
+                let result = Err(error);
+                connection.logger.finished(&result);
+            }
+        }
         Ok(())
     }
 
@@ -392,6 +415,8 @@ where
         let Some(mut connection) = self.connections.remove(&token) else {
             return;
         };
+        self.continuations
+            .retain(|work| !matches!(work, WorkItem::Connection(queued) if *queued == token));
         let deregistration = self.poll.registry().deregister(&mut connection.socket);
         let result = match (result, deregistration) {
             (Err(error), _) | (Ok(()), Err(error)) => Err(error),
@@ -462,6 +487,24 @@ mod tests {
             "accepted {} connections, expected {expected}",
             event_loop.connections.len()
         );
+    }
+
+    fn accept_one_without_servicing_continuations<L, F>(event_loop: &mut EventLoop<L, F>)
+    where
+        L: EventLogger,
+        F: FnMut(&mio::net::TcpStream) -> L,
+    {
+        for _ in 0..20 {
+            event_loop
+                .poll
+                .poll(&mut event_loop.events, Some(Duration::from_millis(50)))
+                .unwrap();
+            event_loop.accept_ready().unwrap();
+            if event_loop.connections.len() == 1 {
+                return;
+            }
+        }
+        panic!("connection was not accepted");
     }
 
     fn token_for_client<L, F>(event_loop: &EventLoop<L, F>, client: &TcpStream) -> Token {
@@ -619,6 +662,61 @@ mod tests {
     }
 
     #[test]
+    fn removed_continuations_do_not_charge_budget_ahead_of_live_work() {
+        let mut event_loop = event_loop();
+        let address = event_loop.local_addr().unwrap();
+
+        for _ in 0..MAX_CONTINUATIONS_PER_POLL {
+            let client = TcpStream::connect(address).unwrap();
+            accept_one_without_servicing_continuations(&mut event_loop);
+            let token = *event_loop.connections.keys().next().unwrap();
+            event_loop.enqueue_connection(token);
+            event_loop.remove_connection(token, Ok(()));
+            drop(client);
+        }
+
+        let mut live_client = TcpStream::connect(address).unwrap();
+        accept_one_without_servicing_continuations(&mut event_loop);
+        let live_token = *event_loop.connections.keys().next().unwrap();
+        let request = b"*1\r\n$4\r\nPING\r\n";
+        live_client.write_all(&request.repeat(65)).unwrap();
+        live_client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let mut live_ready = false;
+        for _ in 0..20 {
+            event_loop
+                .poll
+                .poll(&mut event_loop.events, Some(Duration::from_millis(50)))
+                .unwrap();
+            live_ready |= event_loop
+                .events
+                .iter()
+                .any(|event| event.token() == live_token && event.is_readable());
+            if live_ready {
+                break;
+            }
+        }
+        assert!(live_ready);
+
+        event_loop.service_connection(
+            live_token,
+            Readiness {
+                readable: true,
+                writable: false,
+            },
+        );
+        event_loop.service_continuations().unwrap();
+
+        assert!(event_loop.continuations.is_empty());
+        let expected = b"+PONG\r\n".repeat(65);
+        let mut response = vec![0; expected.len()];
+        live_client.read_exact(&mut response).unwrap();
+        assert_eq!(response, expected);
+    }
+
+    #[test]
     fn token_exhaustion_is_exact_and_does_not_wrap() {
         let mut event_loop = event_loop();
         event_loop.next_token = usize::MAX;
@@ -697,6 +795,68 @@ mod tests {
             writable: true,
         });
         event_loop.service_ready_events().unwrap();
+        assert_eq!(finished.get(), 1);
+    }
+
+    #[test]
+    fn fatal_driver_error_finishes_active_loggers_once_and_is_preserved() {
+        let finished = Rc::new(Cell::new(0));
+        let finished_for_factory = Rc::clone(&finished);
+        let mut event_loop = EventLoop::bind(
+            "127.0.0.1:0",
+            move |_stream| CountingLogger {
+                finished: Rc::clone(&finished_for_factory),
+            },
+            MAX_INCOMPLETE_BUFFER,
+        )
+        .unwrap();
+        let address = event_loop.local_addr().unwrap();
+        let _clients = [
+            TcpStream::connect(address).unwrap(),
+            TcpStream::connect(address).unwrap(),
+        ];
+        accept_connections(&mut event_loop, 2);
+        event_loop.next_token = usize::MAX;
+        let _failing_client = TcpStream::connect(address).unwrap();
+
+        let error = event_loop
+            .drive_once(Some(Duration::from_millis(50)))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "connection token space exhausted");
+        assert!(event_loop.connections.is_empty());
+        assert_eq!(finished.get(), 2);
+    }
+
+    #[test]
+    fn failed_registration_does_not_increment_test_runner_count() {
+        let finished = Rc::new(Cell::new(0));
+        let finished_for_factory = Rc::clone(&finished);
+        let mut event_loop = EventLoop::bind(
+            "127.0.0.1:0",
+            move |_stream| CountingLogger {
+                finished: Rc::clone(&finished_for_factory),
+            },
+            MAX_INCOMPLETE_BUFFER,
+        )
+        .unwrap();
+        let _client = TcpStream::connect(event_loop.local_addr().unwrap()).unwrap();
+        event_loop
+            .poll
+            .poll(&mut event_loop.events, Some(Duration::from_millis(50)))
+            .unwrap();
+        let (mut socket, _) = event_loop.listener.accept().unwrap();
+        event_loop
+            .poll
+            .registry()
+            .register(&mut socket, Token(9_999), mio::Interest::READABLE)
+            .unwrap();
+
+        event_loop.register_connection(socket).unwrap();
+
+        assert_eq!(event_loop.accepted_connections, 0);
+        assert!(event_loop.connections.is_empty());
         assert_eq!(finished.get(), 1);
     }
 
